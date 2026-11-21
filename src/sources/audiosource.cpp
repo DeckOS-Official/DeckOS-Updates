@@ -1,0 +1,389 @@
+#include "sources/audiosource.h"
+
+#include "util/assert.h"
+#include "util/logger.h"
+
+namespace mixxx {
+
+namespace {
+
+const Logger kLogger("AudioSource");
+
+// Maximum number of sample frames to verify that decoding the audio
+// stream works.
+// NOTE(2020-05-01): A single frame is sufficient to reliably detect
+// the broken FAAD2 v2.9.1 library.
+constexpr SINT kVerifyReadableMaxFrameCount = 1;
+
+} // anonymous namespace
+
+AudioSource::AudioSource(const QUrl& url)
+        : UrlResource(url) {
+}
+
+AudioSource::AudioSource(
+        const AudioSource& inner,
+        const audio::SignalInfo& signalInfo)
+        : UrlResource(inner),
+          m_signalInfo(signalInfo),
+          m_bitrate(inner.m_bitrate),
+          m_frameIndexRange(inner.m_frameIndexRange) {
+    DEBUG_ASSERT(m_frameIndexRange.orientation() != IndexRange::Orientation::Backward);
+}
+
+AudioSource::OpenResult AudioSource::open(
+        OpenMode mode,
+        const OpenParams& params) {
+    close(); // reopening is not supported
+    DEBUG_ASSERT(!getSignalInfo().isValid());
+
+    OpenResult result;
+    try {
+        result = tryOpen(mode, params);
+    } catch (const std::exception& e) {
+        qWarning() << "Caught unexpected exception from SoundSource::tryOpen():" << e.what();
+        result = OpenResult::Failed;
+    } catch (...) {
+        qWarning() << "Caught unknown exception from SoundSource::tryOpen()";
+        result = OpenResult::Failed;
+    }
+    if (OpenResult::Succeeded != result) {
+        close(); // rollback
+    }
+    return result;
+}
+
+bool AudioSource::initFrameIndexRangeOnce(
+        IndexRange frameIndexRange) {
+    VERIFY_OR_DEBUG_ASSERT(frameIndexRange.orientation() != IndexRange::Orientation::Backward) {
+        kLogger.warning()
+                << "Backward frame index range not supported"
+                << frameIndexRange;
+        return false; // abort
+    }
+    if (!m_frameIndexRange.empty() &&
+            m_frameIndexRange != frameIndexRange) {
+        kLogger.warning()
+                << "Frame index range has already been initialized to"
+                << m_frameIndexRange
+                << "which differs from"
+                << frameIndexRange;
+        return false; // abort
+    }
+    m_frameIndexRange = frameIndexRange;
+    return true;
+}
+
+bool AudioSource::initChannelCountOnce(
+        audio::ChannelCount channelCount) {
+    if (!channelCount.isValid()) {
+        kLogger.warning()
+                << "Invalid channel count"
+                << channelCount;
+        return false; // abort
+    }
+    if (m_signalInfo.getChannelCount().isValid() &&
+            m_signalInfo.getChannelCount() != channelCount) {
+        kLogger.warning()
+                << "Channel count has already been initialized to"
+                << m_signalInfo.getChannelCount()
+                << "which differs from"
+                << channelCount;
+        return false; // abort
+    }
+    m_signalInfo.setChannelCount(channelCount);
+    return true;
+}
+
+bool AudioSource::initSampleRateOnce(
+        audio::SampleRate sampleRate) {
+    if (!sampleRate.isValid()) {
+        kLogger.warning()
+                << "Invalid sample rate"
+                << sampleRate;
+        return false; // abort
+    }
+    if (m_signalInfo.getSampleRate().isValid() &&
+            m_signalInfo.getSampleRate() != sampleRate) {
+        kLogger.warning()
+                << "Sample rate has already been initialized to"
+                << m_signalInfo.getSampleRate()
+                << "which differs from"
+                << sampleRate;
+        return false; // abort
+    }
+    m_signalInfo.setSampleRate(sampleRate);
+    return true;
+}
+
+bool AudioSource::initBitrateOnce(audio::Bitrate bitrate) {
+    // Bitrate is optional and might be invalid (= audio::Bitrate())
+    if (bitrate < audio::Bitrate()) {
+        kLogger.warning()
+                << "Invalid bitrate"
+                << bitrate;
+        return false; // abort
+    }
+    VERIFY_OR_DEBUG_ASSERT(
+            !m_bitrate.isValid() ||
+            m_bitrate == bitrate) {
+        kLogger.warning()
+                << "Bitrate has already been initialized to"
+                << m_bitrate
+                << "which differs from"
+                << bitrate;
+        return false; // abort
+    }
+    m_bitrate = bitrate;
+    return true;
+}
+
+bool AudioSource::verifyReadable() {
+    // No early return desired! All tests should be performed, even
+    // if some fail.
+    bool result = true;
+    if (!m_signalInfo.getChannelCount().isValid()) {
+        kLogger.warning()
+                << "Invalid number of channels:"
+                << getSignalInfo().getChannelCount()
+                << "is out of range ["
+                << audio::ChannelCount::min()
+                << ","
+                << audio::ChannelCount::max()
+                << "]";
+        result = false;
+    }
+    if (!m_signalInfo.getSampleRate().isValid()) {
+        kLogger.warning()
+                << "Invalid sample rate:"
+                << getSignalInfo().getSampleRate()
+                << "is out of range ["
+                << audio::SampleRate::min()
+                << ","
+                << audio::SampleRate::max()
+                << "]";
+        result = false;
+    }
+    DEBUG_ASSERT(result == m_signalInfo.isValid());
+    // Bitrate is optional and might be invalid (= audio::Bitrate())
+    if (m_bitrate != audio::Bitrate()) {
+        // Non-default bitrate must be valid
+        VERIFY_OR_DEBUG_ASSERT(m_bitrate.isValid()) {
+            kLogger.warning()
+                    << "Invalid bitrate"
+                    << m_bitrate;
+            // Don't set the result to false, because bitrate is only
+            // an informational property that does not effect the ability
+            // to decode audio data!
+        }
+    }
+    if (!result) {
+        // Invalid or inconsistent properties detected. We can abort
+        // at this point and do not need to perform any read tests.
+        return false;
+    }
+    if (frameIndexRange().empty()) {
+        kLogger.warning()
+                << "No audio data available, i.e. stream is empty";
+        // Don't return false, even if reading from an empty source
+        // is pointless. It is still a valid audio stream.
+        return true;
+    }
+    // Try to read some test frames to ensure that decoding actually works!
+    //
+    // Counterexample: The broken FAAD version 2.9.1 is able to open a file
+    // but then fails to decode any sample frames.
+    const SINT numSampleFrames =
+            math_min(kVerifyReadableMaxFrameCount, frameIndexRange().length());
+    SampleBuffer sampleBuffer(
+            m_signalInfo.frames2samples(numSampleFrames));
+    WritableSampleFrames writableSampleFrames(
+            frameIndexRange().splitAndShrinkFront(numSampleFrames),
+            SampleBuffer::WritableSlice(sampleBuffer));
+    auto readableSampleFrames = readSampleFrames(writableSampleFrames);
+    DEBUG_ASSERT(readableSampleFrames.frameIndexRange().isSubrangeOf(
+            writableSampleFrames.frameIndexRange()));
+    if (readableSampleFrames.frameIndexRange().length() <
+            writableSampleFrames.frameIndexRange().length()) {
+        kLogger.warning()
+                << "Read test failed:"
+                << "expected ="
+                << writableSampleFrames.frameIndexRange()
+                << ", actual ="
+                << readableSampleFrames.frameIndexRange();
+        return false;
+    }
+    return true;
+}
+
+std::optional<WritableSampleFrames> AudioSource::clampWritableSampleFrames(
+        const WritableSampleFrames& sampleFrames) const {
+    const auto clampedFrameIndexRange =
+            intersect2(sampleFrames.frameIndexRange(), frameIndexRange());
+
+    if (!clampedFrameIndexRange) {
+        return std::nullopt;
+    }
+    const auto readableFrameIndexRange = *clampedFrameIndexRange;
+
+    // adjust offset and length of the sample buffer
+    DEBUG_ASSERT(
+            sampleFrames.frameIndexRange().start() <=
+            readableFrameIndexRange.end());
+    auto writableFrameIndexRange =
+            IndexRange::between(
+                    sampleFrames.frameIndexRange().start(),
+                    readableFrameIndexRange.end());
+    const SINT minSampleBufferCapacity =
+            m_signalInfo.frames2samples(
+                    writableFrameIndexRange.length());
+    VERIFY_OR_DEBUG_ASSERT(
+            sampleFrames.writableLength() >=
+            minSampleBufferCapacity) {
+        kLogger.critical()
+                << "Capacity of output buffer is too small"
+                << sampleFrames.writableLength()
+                << "<"
+                << minSampleBufferCapacity
+                << "to store all readable sample frames"
+                << readableFrameIndexRange
+                << "into writable sample frames"
+                << writableFrameIndexRange;
+        writableFrameIndexRange =
+                writableFrameIndexRange.splitAndShrinkFront(
+                        m_signalInfo.samples2frames(
+                                sampleFrames.writableLength()));
+        kLogger.warning()
+                << "Reduced writable sample frames"
+                << writableFrameIndexRange;
+    }
+    DEBUG_ASSERT(
+            readableFrameIndexRange.start() >=
+            writableFrameIndexRange.start());
+    const SINT writableFrameOffset =
+            readableFrameIndexRange.start() -
+            writableFrameIndexRange.start();
+    writableFrameIndexRange.shrinkFront(
+            writableFrameOffset);
+    return WritableSampleFrames(
+            writableFrameIndexRange,
+            SampleBuffer::WritableSlice(
+                    sampleFrames.writableData(
+                            m_signalInfo.frames2samples(writableFrameOffset)),
+                    m_signalInfo.frames2samples(
+                            writableFrameIndexRange.length())));
+}
+
+ReadableSampleFrames AudioSource::readSampleFrames(
+        const WritableSampleFrames& sampleFrames) {
+    const auto clamped =
+            clampWritableSampleFrames(sampleFrames);
+    if (!clamped) {
+        // result is undefined
+        // TODO: Changing the return type to std::optional<ReadableSampleFrames>
+        // and instead returning std::nullopt here would be more appropriate
+        return ReadableSampleFrames(
+                IndexRange::forward(sampleFrames.frameIndexRange().start(), 0));
+    }
+    const auto writable = *clamped;
+    if (writable.frameIndexRange().empty()) {
+        // result is empty
+        return ReadableSampleFrames(writable.frameIndexRange());
+    } else {
+        // forward clamped request
+        ReadableSampleFrames readable = readSampleFramesClamped(writable);
+        DEBUG_ASSERT(readable.frameIndexRange().empty() ||
+                readable.frameIndexRange().isSubrangeOf(writable.frameIndexRange()));
+        if (readable.frameIndexRange() != writable.frameIndexRange()) {
+            // Bite DJ: do NOT conclude that the audio data ends here, for a
+            // short read or an empty one.
+            //
+            // Upstream shrank the readable range back to this position,
+            // writing off the whole remainder of the track -- permanently.
+            // The narrowed range is propagated to every source in the proxy
+            // chain by adjustFrameIndexRange(), and CachingReader only ever
+            // intersects the range it carries with the one each read
+            // reports, so nothing can widen it again for the life of the
+            // track load. A deck that hit this played silence to the end of
+            // the track with no way back short of reloading it.
+            //
+            // Shrinking is a claim about the file's content, and a single
+            // failed read is no evidence about content: it is equally well
+            // explained by the storage having gone away, which on this device
+            // is routine rather than exceptional. The music lives on
+            // hot-pluggable USB drives behind a dwc_otg controller that is
+            // known to drop and re-enumerate them mid-session (see
+            // usbcore.old_scheme_first in the sharkware KERNEL_OPTIONS and why
+            // it is there). One such blink used to cost the rest of the track.
+            //
+            // An earlier revision kept shrinking on *partial* reads, on the
+            // theory that reading some frames and then stopping is positive
+            // evidence about where the decodable data ends. It is not: a drive
+            // that fails mid-transfer returns exactly that, and a partial read
+            // is what the reported unit hit -- 1010 frames of a requested 8192,
+            // four minutes into a track, after which the deck was silent for
+            // the rest of it while the other deck played on.
+            //
+            // So decide nothing here. Report the shortfall and hand back what
+            // was read; the caller owns the retry and knows whether the
+            // storage is still there. CachingReaderWorker re-opens the file and
+            // reads the same range again, and only calls
+            // shrinkReadableFrameIndexRange() below once a fresh decoder on a
+            // fresh file handle stops at exactly the same frame -- which is
+            // evidence about content, because it survived the file being
+            // opened anew.
+            kLogger.warning()
+                    << "Failed to read sample frames:"
+                    << "expected =" << writable.frameIndexRange()
+                    << ", actual =" << readable.frameIndexRange();
+        }
+        return readable;
+    }
+}
+
+bool AudioSource::shrinkReadableFrameIndexRange(
+        IndexRange readableFrameIndexRange) {
+    VERIFY_OR_DEBUG_ASSERT(!readableFrameIndexRange.empty()) {
+        // An empty range would write off the whole track. Refuse it: an empty
+        // read is never evidence about content (see readSampleFrames() above).
+        return false;
+    }
+    auto shrinkedFrameIndexRange = m_frameIndexRange;
+    // Adjust lower bound of readable audio data
+    if (readableFrameIndexRange.start() > shrinkedFrameIndexRange.start()) {
+        shrinkedFrameIndexRange.shrinkFront(
+                readableFrameIndexRange.start() -
+                shrinkedFrameIndexRange.start());
+    }
+    // Adjust upper bound of readable audio data
+    if (readableFrameIndexRange.end() < shrinkedFrameIndexRange.end()) {
+        shrinkedFrameIndexRange.shrinkBack(
+                shrinkedFrameIndexRange.end() -
+                readableFrameIndexRange.end());
+    }
+    if (shrinkedFrameIndexRange == m_frameIndexRange) {
+        return false;
+    }
+    DEBUG_ASSERT(shrinkedFrameIndexRange.isSubrangeOf(m_frameIndexRange) &&
+            shrinkedFrameIndexRange.length() < m_frameIndexRange.length());
+    kLogger.info()
+            << "Shrinking readable frame index range:"
+            << "before =" << m_frameIndexRange
+            << ", after =" << shrinkedFrameIndexRange;
+    // Propagate the adjustments to all participants in the
+    // inheritance hierarchy.
+    // NOTE(2019-08-31, uklotzde): This is an ugly hack to overcome
+    // the previous assumption that the frame index range is immutable
+    // for the whole lifetime of an AudioSource. As we know now it is
+    // not and for a future re-design we need to account for this fact!!
+    adjustFrameIndexRange(shrinkedFrameIndexRange);
+    return true;
+}
+
+void AudioSource::adjustFrameIndexRange(
+        IndexRange frameIndexRange) {
+    DEBUG_ASSERT(frameIndexRange.isSubrangeOf(m_frameIndexRange));
+    m_frameIndexRange = frameIndexRange;
+}
+
+} // namespace mixxx

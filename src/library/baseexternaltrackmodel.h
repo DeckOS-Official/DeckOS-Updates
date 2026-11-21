@@ -1,0 +1,36 @@
+#pragma once
+
+#include <QHash>
+#include <QObject>
+
+#include "library/basesqltablemodel.h"
+#include "library/trackmodel.h"
+
+class TrackCollection;
+class QModelIndex;
+class QString;
+
+class BaseExternalTrackModel : public BaseSqlTableModel {
+    Q_OBJECT
+  public:
+    BaseExternalTrackModel(QObject* parent,
+                           TrackCollectionManager* pTrackCollectionManager,
+                           const char* settingsNamespace,
+                           const QString& trackTable,
+                           QSharedPointer<BaseTrackCache> trackSource);
+    ~BaseExternalTrackModel() override;
+
+    Capabilities getCapabilities() const override;
+    TrackId getTrackId(const QModelIndex& index) const override;
+    TrackPointer getTrack(const QModelIndex& index) const override;
+    bool isColumnInternal(int column) override;
+    Qt::ItemFlags flags(const QModelIndex& index) const override;
+
+  protected:
+    void updateTrackIdLookup() override;
+
+  private:
+    TrackId doGetTrackId(const TrackPointer& pTrack) const override;
+
+    QHash<QString, TrackId> m_trackIdsByLocation;
+};
