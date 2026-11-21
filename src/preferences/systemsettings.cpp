@@ -911,8 +911,37 @@ bool SystemSettings::ejectMountPoint(const QString& mountPoint,
     return false;
 }
 
+namespace {
+// Whole-disk name ("sda", "mmcblk0") of a block device such as /dev/sda3.
+QString diskOfBlockDevice(const QString& device) {
+    const QString name = QFileInfo(QFileInfo(device).canonicalFilePath()).fileName();
+    if (name.isEmpty()) {
+        return QString();
+    }
+    const QFileInfo sysEntry(QStringLiteral("/sys/class/block/") + name);
+    const QString sysPath = sysEntry.canonicalFilePath();
+    if (sysPath.isEmpty()) {
+        return QString();
+    }
+    if (QFileInfo::exists(sysPath + QStringLiteral("/partition"))) {
+        return QFileInfo(sysPath).dir().dirName();
+    }
+    return name;
+}
+} // namespace
+
+bool SystemSettings::isFixedRow(int index) const {
+    if (index < 0 || index >= m_usbMounts.size()) {
+        return false;
+    }
+    const QString systemDisk = diskOfBlockDevice(
+            QString::fromUtf8(QStorageInfo(QStringLiteral("/")).device()));
+    const QString disk = diskOfBlockDevice(m_usbMounts.at(index).device);
+    return !systemDisk.isEmpty() && disk == systemDisk;
+}
+
 void SystemSettings::ejectRow(int index) {
-    if (index < 0 || index >= m_usbMounts.size() || m_ejecting) {
+    if (index < 0 || index >= m_usbMounts.size() || m_ejecting || isFixedRow(index)) {
         return;
     }
     m_ejecting = true;

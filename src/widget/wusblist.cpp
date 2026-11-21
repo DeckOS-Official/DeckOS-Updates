@@ -403,6 +403,7 @@ void WUsbList::rebuildRows(const QStringList& labels) {
         renderEmpty();
         return;
     }
+    SystemSettings* pRowSettings = SystemSettings::tryInstance();
     for (int i = 0; i < labels.size(); ++i) {
         auto* pLabel = new QLabel(labels.at(i), m_pContent);
         pLabel->setObjectName(kRowLabelObjectName);
@@ -423,6 +424,11 @@ void WUsbList::rebuildRows(const QStringList& labels) {
         pEject->setProperty(kArmedProperty, false);
         connect(pEject, &QPushButton::clicked, this, &WUsbList::onEjectClicked);
         m_pLayout->addWidget(pEject, i, 2);
+        if (pRowSettings && pRowSettings->isFixedRow(i)) {
+            // Internal partition (DeckOS Record): recordable, never ejectable.
+            pEject->setEnabled(false);
+            pEject->hide();
+        }
 
         m_rowWidgets.append(pLabel);
         m_rowWidgets.append(pRecord);

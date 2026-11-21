@@ -92,6 +92,9 @@ class SystemSettings : public QObject {
     // mirroring ejectDrive(); false for an unconfigured port or one with
     // nothing mounted. This is what [BiteDJ],drive<N>_playing publishes.
     bool isDrivePlaying(int driveNumber) const;
+    // True for a partition of the system disk (the DeckOS "Record" partition):
+    // it is listed like a USB drive and can be recorded to, but never ejected.
+    bool isFixedRow(int index) const;
 
     // The drive-playing rule, in four static pieces. updateDrivePlaying() is
     // these plus the CO writes, and nothing else — split out because resolving a
